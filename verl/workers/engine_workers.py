@@ -215,7 +215,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         final_output = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics})
         return final_output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"),
+        blocking=False,
+        put_data=False,
+        convert_type="TensorDict",
+    )
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
         """Split a batch into N mini-batches run for multiple epochs
 
@@ -299,7 +304,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = None
         return output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"),
+        blocking=False,
+        put_data=False,
+        convert_type="TensorDict",
+    )
     def train_batch(self, data: TensorDict) -> TensorDict:
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
@@ -354,7 +364,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         return final_output
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"),
+        blocking=False,
+        put_data=True,
+        convert_type="TensorDict",
+    )
     def infer_batch(self, data: TensorDict) -> TensorDict:
         # add mfu calculator
         global_token_num = tu.get(data, key="global_token_num")
@@ -580,14 +595,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"), put_data=True, convert_type="TensorDict"
+    )
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"), put_data=True, convert_type="TensorDict"
+    )
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
@@ -595,7 +614,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @register(
+        dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"),
+        put_data=False,
+        convert_type="TensorDict",
+    )
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
