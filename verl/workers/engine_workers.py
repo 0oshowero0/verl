@@ -218,7 +218,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(
         dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"),
         blocking=False,
-        put_data=False,
     )
     def train_mini_batch(self, data: TensorDict) -> TensorDict:
         """Split a batch into N mini-batches run for multiple epochs
@@ -364,7 +363,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(
         dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"),
         blocking=False,
-        put_data=True,
     )
     def infer_batch(self, data: TensorDict) -> TensorDict:
         # add mfu calculator
@@ -591,7 +589,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"), put_data=True)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
@@ -600,18 +598,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(
         dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"),
-        put_data=True,
     )
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
         output = self.actor.infer_batch(data)
-
         return output.cpu() if output is not None else None
 
     @register(
         dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"),
-        put_data=False,
     )
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
