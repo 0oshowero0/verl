@@ -36,7 +36,7 @@ from transfer_queue import KVBatchMeta
 from verl.utils import tensordict_utils as tu
 
 logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 tq.init()
@@ -108,6 +108,8 @@ async def _async_update_meta_with_output(output: TensorDict, meta: KVBatchMeta, 
         for key, val in output.items():
             if isinstance(val, NonTensorData):
                 meta_data[key] = val.data
+        logger.info(f"Converting output from {func_name} (pid={os.getpid()}): receiving fields {list(output.keys())} with batch_size {output.batch_size}. "
+                    f"Fields {list(meta_data.keys())} are identified as extra_info and will not be put into TQ.")
     else:
         raise TypeError(f"Only support TensorDict format of output, but got {type(output)}")
 
@@ -251,7 +253,7 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
             if meta is None:
                 return func(*args, **kwargs)
             else:
-                logger.info(f"Task {func.__name__} (pid={pid}) is getting len_samples={meta.size}")
+                logger.info(f"Task {func.__name__} (pid={pid}) is getting meta with fields={meta.fields} with batch_size={meta.size}. Converting to TensorDict...")
                 args = [_meta_to_realdata(arg) if isinstance(arg, KVBatchMeta) else arg for arg in args]
                 kwargs = {k: _meta_to_realdata(v) if isinstance(v, KVBatchMeta) else v for k, v in kwargs.items()}
                 output = func(*args, **kwargs)
@@ -273,7 +275,7 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
             if meta is None:
                 return await func(*args, **kwargs)
             else:
-                logger.info(f"Task {func.__name__} (pid={pid}) is getting len_samples={meta.size}")
+                logger.info(f"Task {func.__name__} (pid={pid}) is getting meta with fields={meta.fields} with batch_size={meta.size}. Converting to TensorDict...")
                 args = [await _async_meta_to_realdata(arg) if isinstance(arg, KVBatchMeta) else arg for arg in args]
                 kwargs = {
                     k: await _async_meta_to_realdata(v) if isinstance(v, KVBatchMeta) else v for k, v in kwargs.items()
