@@ -79,7 +79,6 @@ INSTRUCTION_THINK = (
 # Map from split name to JSON filename in the dataset
 SPLIT_FILE_MAP = {
     "rl_train": "onethinker_rl_train.json",
-    "rl_train_further_sampled": "onethinker_rl_train_filtered.json",
     "rl_train_unsampled": "onethinker_rl_train_unsampled.json",
     "sft_image": "onethinker_sft_image.json",
     "sft_video": "onethinker_sft_video.json",
@@ -223,10 +222,11 @@ def process_record(example: dict, idx: int, split: str, dataset_root: str) -> di
         },
     }
 
-    if images:
-        record["images"] = images
-    if videos:
-        record["videos"] = videos
+    # Always include both fields to ensure a consistent Arrow schema when mixing
+    # image and video records in the same Dataset.from_list() call.
+    # Image records carry an empty videos list, and vice versa.
+    record["images"] = images  # [] for video records
+    record["videos"] = videos  # [] for image records
 
     return record
 
@@ -264,21 +264,18 @@ def load_and_process(
 
     print(f"  Processed: {len(processed)}  |  Skipped (missing media): {skipped}", flush=True)
 
-    # Separate image vs video records so we can handle mixed datasets cleanly
-    image_records = [r for r in processed if "images" in r]
-    video_records = [r for r in processed if "videos" in r]
-    text_records = [r for r in processed if "images" not in r and "videos" not in r]
-
-    all_records = processed  # keep original order
+    all_records = processed
 
     # Build HuggingFace Dataset — cast images using datasets.Image() for proper parquet storage
     hf_dataset = Dataset.from_list(all_records)
 
-    # Cast image column so PIL images are serialised as bytes in parquet
-    if any("images" in r for r in processed):
-        import datasets as ds_lib
+    # Both columns are always present ([] for inapplicable records), so we can
+    # unconditionally cast them.  This avoids a ValueError when the inferred
+    # Arrow schema omits a column because all sampled rows happened to be the
+    # other modality.
+    import datasets as ds_lib
 
-        hf_dataset = hf_dataset.cast_column("images", ds_lib.Sequence(ds_lib.Image()))
+    hf_dataset = hf_dataset.cast_column("images", ds_lib.Sequence(ds_lib.Image()))
 
     return hf_dataset
 
