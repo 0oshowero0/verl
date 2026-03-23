@@ -79,6 +79,7 @@ INSTRUCTION_THINK = (
 # Map from split name to JSON filename in the dataset
 SPLIT_FILE_MAP = {
     "rl_train": "onethinker_rl_train.json",
+    "rl_train_further_sampled": "onethinker_rl_train_filtered.json",
     "rl_train_unsampled": "onethinker_rl_train_unsampled.json",
     "sft_image": "onethinker_sft_image.json",
     "sft_video": "onethinker_sft_video.json",
