@@ -73,15 +73,17 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 def _find_meta(*args, **kwargs):
     for arg in args:
-        if isinstance(arg, BatchMeta):
+        if isinstance(arg, BatchMeta | KVBatchMeta):
             return arg
     for v in kwargs.values():
-        if isinstance(v, BatchMeta):
+        if isinstance(v, BatchMeta | KVBatchMeta):
             return v
     return None
 
 
 async def _async_meta_to_realdata(meta: BatchMeta) -> TensorDict:
+    if isinstance(meta, KVBatchMeta):
+        meta = await async_kv_batch_meta2batch_meta(meta)
     meta_info = copy.deepcopy(meta.extra_info)
     if meta.size == 0:
         empty_td = TensorDict({}, batch_size=(0,))
@@ -285,7 +287,8 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
     # TODO: move to the top
     from verl.single_controller.base.decorator import _check_dispatch_mode
 
-    _check_dispatch_mode(dispatch_mode)
+    if dispatch_mode is not None:
+        _check_dispatch_mode(dispatch_mode)
 
     def decorator(func):
         pid = os.getpid()
@@ -300,9 +303,14 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                 if not TQ_INITIALIZED:
                     tq.init()
                     TQ_INITIALIZED = True
+
+                is_kv_batch_meta = isinstance(batch_meta, KVBatchMeta)
+
                 t1 = time.time()
-                args = [_meta_to_realdata(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
-                kwargs = {k: _meta_to_realdata(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()}
+                args = [_meta_to_realdata(arg) if isinstance(arg, BatchMeta | KVBatchMeta) else arg for arg in args]
+                kwargs = {
+                    k: _meta_to_realdata(v) if isinstance(v, BatchMeta | KVBatchMeta) else v for k, v in kwargs.items()
+                }
                 t2 = time.time()
                 logger.info(
                     f"Task {func.__name__} (pid={pid}) is getting len_samples={batch_meta.size}, cost time: {t2 - t1}"
@@ -318,9 +326,14 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                         )
                         put_data = True
 
-                need_collect = _compute_need_collect(dispatch_mode, args)
+                if dispatch_mode is not None:
+                    need_collect = _compute_need_collect(dispatch_mode, args)
+                else:
+                    need_collect = True
                 if put_data and need_collect:
                     updated_meta = _update_meta_with_output(output, batch_meta, func.__name__)
+                    if is_kv_batch_meta:
+                        updated_meta = batch_meta2kv_batch_meta(updated_meta)
                     return updated_meta
                 return _postprocess_common(output, put_data, need_collect)
 
@@ -334,10 +347,17 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                 if not TQ_INITIALIZED:
                     tq.init()
                     TQ_INITIALIZED = True
+
+                is_kv_batch_meta = isinstance(batch_meta, KVBatchMeta)
+
                 t1 = time.time()
-                args = [await _async_meta_to_realdata(arg) if isinstance(arg, BatchMeta) else arg for arg in args]
+                args = [
+                    await _async_meta_to_realdata(arg) if isinstance(arg, BatchMeta | KVBatchMeta) else arg
+                    for arg in args
+                ]
                 kwargs = {
-                    k: await _async_meta_to_realdata(v) if isinstance(v, BatchMeta) else v for k, v in kwargs.items()
+                    k: await _async_meta_to_realdata(v) if isinstance(v, BatchMeta | KVBatchMeta) else v
+                    for k, v in kwargs.items()
                 }
                 t2 = time.time()
                 logger.info(
@@ -354,9 +374,14 @@ def tqbridge(dispatch_mode: "dict | Dispatch" = None):
                         )
                         put_data = True
 
-                need_collect = _compute_need_collect(dispatch_mode, args)
+                if dispatch_mode is not None:
+                    need_collect = _compute_need_collect(dispatch_mode, args)
+                else:
+                    need_collect = True
                 if put_data and need_collect:
                     updated_meta = await _async_update_meta_with_output(output, batch_meta, func.__name__)
+                    if is_kv_batch_meta:
+                        updated_meta = await async_batch_meta2kv_batch_meta(updated_meta)
                     return updated_meta
                 return _postprocess_common(output, put_data, need_collect)
 

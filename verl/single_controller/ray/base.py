@@ -294,7 +294,7 @@ def split_resource_pool(
         start_bundle_idx_list = np.cumsum([0] + split_size_list[:-1])
 
     # ensure resource_pool.pgs has been initialized
-    placement_groups = resource_pool.get_placement_groups()
+    placement_groups = resource_pool.get_placement_groups(device_name=get_device_name())
     split_resource_pools = [
         SubRayResourcePool(
             process_on_nodes=resource_pool.store,

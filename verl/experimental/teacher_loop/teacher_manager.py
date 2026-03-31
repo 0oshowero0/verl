@@ -25,6 +25,7 @@ from verl.experimental.agent_loop import AsyncLLMServerManager
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.config import DistillationConfig, DistillationLossConfig
 
 
@@ -125,6 +126,7 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
 
+    @tqbridge()
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
