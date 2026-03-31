@@ -55,6 +55,7 @@ from verl.single_controller.ray import (
     ResourcePoolManager,
     create_colocated_worker_cls,
 )
+from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler, run_ppo
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
@@ -84,7 +85,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.config import CriticConfig
+from verl.workers.config import CriticConfig, DistillationConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.utils.losses import value_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
@@ -335,7 +336,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logger.exception(f"Error in _run_prompt: {e}")
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
-    async def _agent_loop_postprocess(self, output: AgentLoopOutput | list[AgentLoopOutput], **kwargs) -> None:
+    async def _agent_loop_postprocess(
+        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+    ) -> None:
         """Put agent loop outputs into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
@@ -363,6 +366,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             position_ids=final_position_ids.unsqueeze(0),  # [1, seq_len] or [1, 4, seq_len]
             kwargs=kwargs,
         )
+
+        # TODO: validate _compute_teacher_logprobs
+        await self._compute_teacher_logprobs(
+            output,
+            prompt_ids=output.prompt_ids,
+            response_ids=output.response_ids,
+            validate=validate,
+        )
+
         if final_output.reward_score is not None:
             for output in outputs[:-1]:
                 output.reward_score = final_output.reward_score
@@ -664,7 +676,21 @@ class PPOTrainer:
         )
         logger.info("reward loop manager initialized")
 
-        # 8. initialize agent loop manager
+        # 8. initialize teacher loop manager
+        if self.use_teacher_policy:
+            from verl.experimental.teacher_loop import TeacherModelManager
+
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+            self.teacher_model_manager = TeacherModelManager(
+                config=self.config.distillation,
+                resource_pool=teacher_resource_pool,
+            )
+            self.distillation_config: DistillationConfig = omega_conf_to_dataclass(self.config.distillation)
+        else:
+            self.teacher_model_manager = None
+            self.distillation_config = None
+
+        # 9. initialize agent loop manager
         manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
         if manager_class_fqn:
             agent_loop_manager_cls = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
@@ -675,11 +701,12 @@ class PPOTrainer:
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
             reward_loop_worker_handles=self.reward_loop_manager.reward_loop_workers,
+            teacher_model_manager=self.teacher_model_manager,
             replay_buffer=self.replay_buffer,
         )
         logger.info("agent loop manager initialized")
 
-        # 9. initialize checkpoint engine manager
+        # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
@@ -1429,6 +1456,18 @@ class TaskRunner:
             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
             self.mapping[Role.Critic] = "global_pool"
 
+    def add_teacher_model_resource_pool(self, config):
+        """Add teacher model worker if enabled."""
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if is_distillation_enabled(config.get("distillation")):
+            # we do not use teacher model workers, so we only register teacher model in resource pool
+            # without registering a teacher model worker in role-worker mapping
+            if config.distillation.teacher_model.enable_resource_pool:
+                self.mapping[Role.TeacherModel] = "teacher_pool"
+            else:
+                self.mapping[Role.TeacherModel] = "global_pool"
+
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
 
@@ -1453,6 +1492,22 @@ class TaskRunner:
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
             self.mapping[Role.RewardModel] = "global_pool"
 
+        distillation_config = config.get("distillation")
+        if is_distillation_enabled(distillation_config):
+            if distillation_config.teacher_model.enable_resource_pool:
+                if distillation_config.teacher_model.n_gpus_per_node <= 0:
+                    raise ValueError("config.distillation.teacher_model.n_gpus_per_node must be greater than 0")
+                if distillation_config.teacher_model.nnodes <= 0:
+                    raise ValueError("config.distillation.teacher_model.nnodes must be greater than 0")
+
+                teacher_pool = [
+                    distillation_config.teacher_model.n_gpus_per_node
+                ] * distillation_config.teacher_model.nnodes
+                resource_pool_spec["teacher_pool"] = teacher_pool
+            else:
+                distillation_config.teacher_model.nnodes = config.trainer.nnodes
+                distillation_config.teacher_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def run(self, config):
@@ -1464,6 +1519,7 @@ class TaskRunner:
 
         self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
+        self.add_teacher_model_resource_pool(config)
         self.init_resource_pool_mgr(config)
 
         trainer = PPOTrainer(
