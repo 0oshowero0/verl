@@ -68,7 +68,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy
+from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_teacher_policy
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -503,6 +503,8 @@ class PPOTrainer:
         self.resource_pool_manager = resource_pool_manager
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
+        self.use_teacher_policy = need_teacher_policy(self.config)
+
         self.replay_buffer = ReplayBuffer()
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
@@ -833,6 +835,16 @@ class PPOTrainer:
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+    def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
+        return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
+
+    def _compute_teacher_colocate(self, batch: KVBatchMeta) -> KVBatchMeta:
+        """Compute teacher logprobs after rollout when teacher and student are colocated."""
+        assert self.teacher_model_manager is not None, "TeacherModelManager is None"
+        teacher_batch = self.teacher_model_manager.compute_logprobs(batch)
+
+        return teacher_batch
 
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table
@@ -1391,6 +1403,11 @@ class PPOTrainer:
             batch = self.replay_buffer.sample(partition_id="train", global_steps=self.global_steps)
         batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         self.checkpoint_manager.sleep_replicas()
+
+        # 3. [OPTIONAL] compute teacher logprobs
+        if self._should_compute_teacher_colocate(batch):
+            with marked_timer("teacher", timing_raw, color="cyan"):
+                batch = self._compute_teacher_colocate(batch)
 
         # 3. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
