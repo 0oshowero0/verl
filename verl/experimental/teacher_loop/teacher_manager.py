@@ -127,8 +127,11 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         return teacher_ids, teacher_logprobs
 
     @tqbridge()
-    async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
+    async def compute_teacher_logprobs_batch(self, data: DataProto | TensorDict) -> DataProto | TensorDict:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
+        use_tensordict = isinstance(data, TensorDict)
+        if use_tensordict:
+            data = DataProto.from_tensordict(data)
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
         tasks = []
         lengths = []
@@ -174,4 +177,8 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
             },
             batch_size=len(data),
         )
-        return DataProto(batch=batch)
+
+        if use_tensordict:
+            return batch
+        else:
+            return DataProto(batch=batch)
