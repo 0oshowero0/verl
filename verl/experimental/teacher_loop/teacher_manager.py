@@ -27,6 +27,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.config import DistillationConfig, DistillationLossConfig
+from verl.workers.utils.padding import left_right_2_no_padding
 
 
 def _get_teacher_sampling_params(
@@ -179,6 +180,6 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
         )
 
         if use_tensordict:
-            return batch
+            return left_right_2_no_padding(batch)
         else:
             return DataProto(batch=batch)
