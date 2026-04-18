@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 
 import ray
 import vllm.entrypoints.cli.serve
+from omegaconf import DictConfig, OmegaConf
 from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
@@ -95,6 +96,7 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        tq_config: Optional[DictConfig] = None,
     ):
         """
         Args:
@@ -115,6 +117,23 @@ class vLLMHttpServer:
 
         self.rollout_mode = rollout_mode
         self.workers = workers
+
+        # TransferQueue: when enabled, incoming requests may carry BatchMeta instead of raw
+        # multi-modal data. The http server (this actor) is the final consumer before vLLM
+        # engine, so we initialize a tq client here for `tq.get_client()` use inside generate.
+        self.tq_config: Optional[DictConfig] = tq_config
+        self.tq_enabled = bool(tq_config is not None and OmegaConf.select(tq_config, "enable", default=False))
+        if self.tq_enabled:
+            try:
+                from verl.utils.transferqueue_utils import TQ_INITIALIZED, tq
+
+                if not TQ_INITIALIZED:
+                    tq.init(tq_config)
+                    import verl.utils.transferqueue_utils as _tq_utils
+
+                    _tq_utils.TQ_INITIALIZED = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"vLLMHttpServer failed to init transfer_queue client: {e}")
 
         self.replica_rank = replica_rank
         self.node_rank = node_rank
@@ -447,6 +466,27 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
+
+        # If TransferQueue is enabled, image_data / video_data may come in as a BatchMeta
+        # (or {"image"/"video": BatchMeta}) reference instead of the raw payload. Materialize
+        # the real data here — right before it is fed to the vLLM engine — so that large
+        # multi-modal tensors are transported via TQ (zero-copy) instead of via Ray ObjectRef.
+        try:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+            if image_data is not None and (
+                isinstance(image_data, BatchMeta)
+                or (isinstance(image_data, dict) and any(isinstance(v, BatchMeta) for v in image_data.values()))
+            ):
+                image_data = await get_multi_modal_data(image_data, mm_label="image")
+            if video_data is not None and (
+                isinstance(video_data, BatchMeta)
+                or (isinstance(video_data, dict) and any(isinstance(v, BatchMeta) for v in video_data.values()))
+            ):
+                video_data = await get_multi_modal_data(video_data, mm_label="video")
+        except ImportError:
+            # transfer_queue not installed or disabled: image_data / video_data stay as-is.
+            pass
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
@@ -873,8 +913,17 @@ class vLLMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        tq_config: Optional[DictConfig] = None,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model)
+        super().__init__(
+            replica_rank,
+            config,
+            model_config,
+            gpus_per_node,
+            is_reward_model,
+            is_teacher_model,
+            tq_config=tq_config,
+        )
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
@@ -943,6 +992,7 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                tq_config=self.tq_config,
             )
             self.servers.append(server)
 

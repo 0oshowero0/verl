@@ -113,10 +113,14 @@ class RolloutReplica(ABC):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        tq_config: Optional[DictConfig] = None,
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig | DiffusionRolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
+        # TransferQueue config — forwarded down to the underlying http server so that it can
+        # instantiate a tq client and materialize BatchMeta multi-modal references on the fly.
+        self.tq_config: Optional[DictConfig] = tq_config
 
         self.world_size = (
             self.config.tensor_model_parallel_size

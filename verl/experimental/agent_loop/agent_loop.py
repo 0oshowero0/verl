@@ -315,6 +315,12 @@ class AgentLoopBase(ABC):
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
+        # TransferQueue integration: optional. When enabled, multi-modal payloads (images /
+        # videos) are stored in TQ and only BatchMeta references are passed around between
+        # AgentLoopWorker, vLLM server and tools — avoiding large Ray object-store copies.
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        self.tq_enabled = bool(self.tq_config is not None and OmegaConf.select(self.tq_config, "enable", default=False))
+
     async def process_vision_info(self, messages: list[dict]) -> dict:
         """Extract images and videos from messages.
 
@@ -467,6 +473,24 @@ class AgentLoopWorker:
             teacher_servers (list[tuple[str, ray.actor.ActorHandle]]): (address, handle) pairs for each teacher server.
         """
         self.config = config
+
+        # TransferQueue: each AgentLoopWorker process needs its own global tq client so that
+        # downstream utilities (get_multi_modal_data / put_multi_modal_data / tqbridge) can
+        # simply call tq.get_client().
+        self.tq_config = OmegaConf.select(config, "transfer_queue", default=None)
+        self.tq_enabled = bool(self.tq_config is not None and OmegaConf.select(self.tq_config, "enable", default=False))
+        if self.tq_enabled:
+            try:
+                from verl.utils.transferqueue_utils import TQ_INITIALIZED, tq
+
+                if not TQ_INITIALIZED:
+                    tq.init(self.tq_config)
+                    # mark initialized so tqbridge / utils don't re-init inside this process
+                    import verl.utils.transferqueue_utils as _tq_utils
+
+                    _tq_utils.TQ_INITIALIZED = True
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"AgentLoopWorker failed to init transfer_queue client: {e}")
         rollout_config, model_config = _get_rollout_and_model_config(config)
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
@@ -1045,6 +1069,13 @@ class AgentLoopManager:
         self.teacher_model_manager = teacher_model_manager
         self.distillation_enabled = is_distillation_enabled(self.config.get("distillation", None))
 
+        # TransferQueue: the manager also needs the tq_config so that it can forward it to the
+        # underlying RolloutReplica (vLLM / sglang http server). When TQ is enabled, the
+        # rollout servers receive BatchMeta instead of raw multi-modal payloads and use TQ to
+        # materialize them locally.
+        self.tq_config = OmegaConf.select(self.config, "transfer_queue", default=None)
+        self.tq_enabled = bool(self.tq_config is not None and OmegaConf.select(self.tq_config, "enable", default=False))
+
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
         # for recipe to change
@@ -1088,12 +1119,19 @@ class AgentLoopManager:
         )
         num_replicas = world_size // rollout_world_size
 
+        replica_extra_kwargs = {}
+        if self.tq_enabled:
+            # Only pass tq_config when enabled — keeps backward compatibility with replica
+            # classes (e.g. trtllm) that haven't added this kwarg.
+            replica_extra_kwargs["tq_config"] = self.tq_config
+
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=replica_rank,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
+                **replica_extra_kwargs,
             )
             for replica_rank in range(num_replicas)
         ]

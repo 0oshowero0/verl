@@ -120,14 +120,46 @@ class ToolAgentLoop(AgentLoopBase):
                 self.interaction_config_file
             )
 
+    async def _put_modality_to_transfer_queue(self, multi_modal_data: dict, modality: str, global_steps: int):
+        """Put images / videos from a single sample into TransferQueue and return BatchMeta.
+
+        The AgentLoop then keeps only the lightweight BatchMeta reference in AgentData, so
+        that downstream Ray RPCs (to vLLM http server) no longer copy the raw payload.
+        """
+        modality_key = "image" if modality == "images" else "video"
+        modality_data = multi_modal_data.get(modality)
+        if not modality_data:
+            return None
+        from verl.utils.transferqueue_utils import put_multi_modal_data
+
+        partition_id = f"train_mm_{global_steps - 1}_{modality_key}"
+        return await put_multi_modal_data(modality_data, partition_id=partition_id, mm_label=modality_key)
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        self.global_steps = kwargs.get("global_steps", -1)
 
         # extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
-        images = multi_modal_data.get("images")
-        videos = multi_modal_data.get("videos")
+
+        if self.tq_enabled:
+            # Fan-out multi-modal payload to TransferQueue; image_data / video_data become
+            # BatchMeta references to reduce Ray object-store pressure between AgentLoopWorker
+            # and vLLM http server.
+            images_meta, videos_meta = await asyncio.gather(
+                self._put_modality_to_transfer_queue(
+                    multi_modal_data=multi_modal_data, modality="images", global_steps=self.global_steps
+                ),
+                self._put_modality_to_transfer_queue(
+                    multi_modal_data=multi_modal_data, modality="videos", global_steps=self.global_steps
+                ),
+            )
+            images = {"image": images_meta} if images_meta is not None else None
+            videos = {"video": videos_meta} if videos_meta is not None else None
+        else:
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
 
         metrics = {}
         request_id = uuid4().hex
@@ -216,11 +248,26 @@ class ToolAgentLoop(AgentLoopBase):
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+
+        # When TQ is enabled, image_data in agent_data is a BatchMeta reference. apply_chat_template
+        # runs locally on the processor and still needs the raw images — materialize them from TQ
+        # just for this call. The BatchMeta is kept on agent_data for downstream vLLM calls.
+        images_for_template = agent_data.image_data
+        videos_for_template = agent_data.video_data
+        if self.tq_enabled and images_for_template is not None:
+            from verl.utils.transferqueue_utils import BatchMeta, get_multi_modal_data
+
+            if isinstance(images_for_template, BatchMeta) or (
+                isinstance(images_for_template, dict)
+                and any(isinstance(v, BatchMeta) for v in images_for_template.values())
+            ):
+                images_for_template = await get_multi_modal_data(images_for_template, mm_label="image")
+
         prompt_ids = await self.apply_chat_template(
             agent_data.messages,
             tools=schemas,
-            images=agent_data.image_data,
-            videos=agent_data.video_data,
+            images=images_for_template,
+            videos=videos_for_template,
         )
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
@@ -382,12 +429,36 @@ class ToolAgentLoop(AgentLoopBase):
         # Update prompt_ids and response_mask
 
         if new_images_this_turn:
-            if agent_data.image_data is None:
-                agent_data.image_data = []
-            elif not isinstance(agent_data.image_data, list):
-                agent_data.image_data = [agent_data.image_data]
-            for img in new_images_this_turn:
-                agent_data.image_data.append(img)
+            if self.tq_enabled:
+                # Upload the new images produced by tools into TransferQueue and merge into the
+                # BatchMeta reference kept on agent_data.image_data, so that subsequent vLLM
+                # generate() calls still receive only BatchMeta.
+                from verl.utils.transferqueue_utils import BatchMeta, put_multi_modal_data
+
+                partition_id = f"train_mm_{self.global_steps - 1}_image"
+                new_meta = await put_multi_modal_data(new_images_this_turn, partition_id=partition_id, mm_label="image")
+                if new_meta is not None:
+                    if agent_data.image_data is None:
+                        agent_data.image_data = {"image": new_meta}
+                    elif isinstance(agent_data.image_data, BatchMeta):
+                        agent_data.image_data = {"image": BatchMeta.concat([agent_data.image_data, new_meta])}
+                    elif isinstance(agent_data.image_data, dict):
+                        existed = agent_data.image_data.get("image")
+                        if existed is None:
+                            agent_data.image_data["image"] = new_meta
+                        elif isinstance(existed, BatchMeta):
+                            agent_data.image_data["image"] = BatchMeta.concat([existed, new_meta])
+                        else:
+                            logger.warning(
+                                f"Unexpected existing image_data['image'] type under TQ mode: {type(existed)}"
+                            )
+            else:
+                if agent_data.image_data is None:
+                    agent_data.image_data = []
+                elif not isinstance(agent_data.image_data, list):
+                    agent_data.image_data = [agent_data.image_data]
+                for img in new_images_this_turn:
+                    agent_data.image_data.append(img)
 
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)

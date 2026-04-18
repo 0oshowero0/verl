@@ -27,6 +27,8 @@ import torch
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
 if TYPE_CHECKING:
+    from PIL import Image
+
     from verl.single_controller.base.decorator import Dispatch
 
 from tensordict import TensorDict
@@ -269,6 +271,81 @@ async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
 
 def kv_batch_meta2batch_meta(meta: KVBatchMeta):
     return _run_async_in_temp_loop(async_kv_batch_meta2batch_meta, meta)
+
+
+async def get_multi_modal_data(
+    meta: "BatchMeta | dict[str, BatchMeta] | None",
+    mm_label: str = "image",
+) -> "list[torch.Tensor | Image.Image] | None":
+    """Fetch multi-modal data (images/videos) from TransferQueue storage for rollout inference.
+
+    This helper is used by the AgentLoop / rollout-server side to materialize the raw
+    multi-modal payload (previously kept only as a BatchMeta reference) right before it is
+    handed off to the vLLM / sglang engine. It supports both a plain BatchMeta and a dict
+    mapping modality label ("image" / "video") to BatchMeta to stay compatible with how the
+    data is put into TQ by the AgentLoop.
+
+    Args:
+        meta: A BatchMeta or a dict like ``{"image": BatchMeta, ...}``.
+        mm_label: modality label used as the key when ``meta`` is a dict and also the field
+            name stored inside the BatchMeta TensorDict.
+
+    Returns:
+        A list of items (one per sample in the BatchMeta), or None if ``meta`` is None /
+        empty.
+    """
+    if meta is None:
+        return None
+
+    if isinstance(meta, dict):
+        if mm_label not in meta:
+            return None
+        batch_meta = meta[mm_label]
+    else:
+        batch_meta = meta
+
+    if not isinstance(batch_meta, BatchMeta):
+        raise ValueError(f"Expected BatchMeta, got {type(batch_meta)}")
+
+    if getattr(batch_meta, "size", 0) == 0:
+        return None
+
+    tq_client = tq.get_client()
+    mm_data_tq = await tq_client.async_get_data(batch_meta)
+
+    mm_data_raw = mm_data_tq.get(mm_label)
+    if mm_data_raw is None:
+        return None
+
+    if isinstance(mm_data_raw, torch.Tensor | NonTensorStack | list):
+        mm_data = [mm_data_raw[i] for i in range(mm_data_tq.batch_size[0])]
+    else:
+        raise NotImplementedError(
+            f"Got {type(mm_data_raw)} for multi-modal data. Currently only support "
+            f"torch.Tensor / NonTensorStack / list."
+        )
+
+    mm_data = [item.data if isinstance(item, NonTensorData) else item for item in mm_data]
+    return mm_data
+
+
+async def put_multi_modal_data(
+    data: "list[torch.Tensor | Image.Image] | None",
+    partition_id: str,
+    mm_label: str = "image",
+) -> "BatchMeta | None":
+    """Upload a list of raw multi-modal items (images / videos) to TransferQueue storage.
+
+    Returns a BatchMeta reference the AgentLoop can later pass around instead of the raw
+    payload. When TQ is not available or ``data`` is empty, returns None.
+    """
+    if not data:
+        return None
+
+    tq_client = tq.get_client()
+    stack = NonTensorStack(*data) if not all(isinstance(x, torch.Tensor) for x in data) else data
+    tensordict = TensorDict({mm_label: stack}, batch_size=[len(data)])
+    return await tq_client.async_put(data=tensordict, partition_id=partition_id)
 
 
 async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
