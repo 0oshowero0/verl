@@ -21,9 +21,12 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
+import transfer_queue as tq
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
+from tensordict import TensorDict
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
@@ -155,6 +158,8 @@ class vLLMHttpServer:
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
+        tq.init()
+        self.tq_client = tq.get_client()
 
         self._post_init(cuda_visible_devices)
 
@@ -444,8 +449,21 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        response_length: Optional[int] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        td = await self.tq_client.async_get_data(prompt_ids)
+
+        prompt_ids = td[0]["prompt_ids"]
+        if "image_data" in td:
+            image_data = td[0]["image_data"]
+        else:
+            image_data = None
+        if "video_data" in td:
+            video_data = td[0]["video_data"]
+        else:
+            video_data = None
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -523,6 +541,7 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            log_probs = log_probs[:response_length]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -542,14 +561,25 @@ class vLLMHttpServer:
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
 
-        return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
-            routed_experts=routed_experts,
-            stop_reason=stop_reason,
-            num_preempted=num_preempted,
-            extra_fields=extra_fields,
+        data = TensorDict()
+        data["token_ids"] = torch.tensor(token_ids).unsqueeze(0)
+        if log_probs is not None:
+            data["log_probs"] = torch.tensor(log_probs).unsqueeze(0)
+        if routed_experts is not None:
+            data["routed_experts"] = torch.tensor(routed_experts).unsqueeze(0)
+
+        data.batch_size = torch.Size([1])
+
+        meta = await self.tq_client.async_put(data, partition_id="agent_loop_output")
+
+        meta.extra_info.update(
+            {
+                "stop_reason": stop_reason,
+                "num_preempted": num_preempted,
+                "extra_fields": extra_fields,
+            }
         )
+        return meta
 
     async def wake_up(self):
         if self.node_rank != 0:

@@ -17,15 +17,18 @@ from typing import Any
 from uuid import uuid4
 
 import torch
+import transfer_queue as tq
 from PIL import Image
+from tensordict import TensorDict
+from transfer_queue import BatchMeta
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tensordict_utils import assign_non_tensor_stack
 from verl.utils.tokenizer import normalize_token_ids
-from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -39,6 +42,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        self.tq_client = tq.get_client()
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -56,34 +60,58 @@ class SingleTurnAgentLoop(AgentLoopBase):
             videos=videos,
         )
 
+        td = TensorDict()
+        assign_non_tensor_stack(td, "prompt_ids", [prompt_ids])
+        if images:
+            assign_non_tensor_stack(td, "image_data", [images])
+        if videos:
+            assign_non_tensor_stack(td, "video_data", [videos])
+
+        td.batch_size = torch.Size([1])
+
+        batch_meta = await self.tq_client.async_put(td, partition_id="agent_loop")
+
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
-            output: TokenOutput = await self.server_manager.generate(
+            output_meta: BatchMeta = await self.server_manager.generate(
                 request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
+                prompt_ids=batch_meta,
                 sampling_params=sampling_params,
-                image_data=images,
-                video_data=videos,
+                response_length=self.response_length,
             )
-        if metrics.get("num_preempted") is None:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-        response_mask = [1] * len(output.token_ids)
 
+        # materialize BatchMeta, which is not really necessary if we register _agent_loop_postprocess
+        # as a callback function
+        data = await self.tq_client.async_get_data(output_meta)
+
+        if metrics.get("num_preempted") is None:
+            _num_preempted = output_meta.extra_info.get("num_preempted")
+            metrics["num_preempted"] = _num_preempted if _num_preempted is not None else -1
+
+        _token_ids = data.get("token_ids").squeeze(0).tolist()
+        response_len = min(len(_token_ids), self.response_length)
+        response_mask = [1] * response_len
+
+        _log_probs = data.get("log_probs")
+        if _log_probs is not None:
+            _log_probs = _log_probs.squeeze(0).tolist()
+        _routed_experts = data.get("routed_experts")
+        if _routed_experts is not None:
+            _routed_experts = _routed_experts.squeeze(0).tolist()
+        _extra_fields = output_meta.extra_info.get("extra_fields")
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
+            response_ids=_token_ids[: self.response_length],
+            response_mask=response_mask,
+            response_logprobs=_log_probs[: self.response_length] if _log_probs is not None else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
-                else None
+                _routed_experts[: len(prompt_ids) + self.response_length] if _routed_experts is not None else None
             ),
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
-            extra_fields=output.extra_fields,
+            extra_fields=_extra_fields if _extra_fields is not None else {},
         )
 
         # keeping the schema consistent with tool_agent_loop
