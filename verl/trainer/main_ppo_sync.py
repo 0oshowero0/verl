@@ -42,7 +42,7 @@ import torch
 
 try:
     import transfer_queue as tq
-    from transfer_queue import KVBatchMeta
+    from transfer_queue import BatchMeta, KVBatchMeta
 except ImportError:
     print("Please install TQ by calling `pip install TransferQueue==0.1.6` and try again.")
     from verl.utils.transferqueue_utils import KVBatchMeta, tq
@@ -99,6 +99,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
+from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.config import CriticConfig, DistillationConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerManager
@@ -290,6 +291,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         tq.init()
         self.background_tasks = set()
 
+    @tqbridge()
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
         validate = batch["validate"] if "validate" in batch else False
@@ -312,9 +314,17 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch:
             default_agent_loop = config.agent.default_agent_loop
+            if default_agent_loop == "single_turn_agent":
+                logger.info(
+                    "`agent_name` is not set and default_agent_loop is `single_turn_agent`. "
+                    "Patch to use `single_turn_agent_tq` instead."
+                )
+                default_agent_loop = "single_turn_agent_tq"
             batch["agent_name"] = NonTensorData(default_agent_loop)
 
-        trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
+        trajectory_info = await get_trajectory_info(
+            batch["global_steps"], [info["index"] for info in batch["extra_info"]], validate
+        )
 
         # create background tasks for each sample in the batch
         for i in range(len(batch)):
@@ -461,25 +471,33 @@ class AgentLoopManagerTQ(AgentLoopManager):
         await instance._init_agent_loop_workers()
         return instance
 
-    def generate_sequences(self, prompts: TensorDict) -> None:
+    def generate_sequences(self, prompts: BatchMeta) -> None:
         """
         Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
         into TransferQueue once an agent loop finished.
 
         Args:
-            prompts (TensorDict): Input batch from train or validation dataset.
+            prompts (BatchMeta): Metadata of input batch from train or validation dataset.
         """
         # mark prompts as pending in replay buffer
-        global_steps = prompts["global_steps"]
-        partition_id = "train" if "validate" not in prompts else "val"
-        items = {uid: {"global_steps": global_steps, "status": "running"} for uid in prompts["uid"]}
+
+        if prompts.size < len(self.agent_loop_workers):
+            raise RuntimeError(
+                f"Batch size {prompts.size} is smaller than the number of AgentLoopWorkers "
+                f"{len(self.agent_loop_workers)}."
+            )
+
+        global_steps = prompts.extra_info.get("global_steps")
+        partition_id = "train" if "validate" not in prompts.extra_info else "val"
+        uids = prompts.extra_info.pop("uids")
+        items = {uid: {"global_steps": global_steps, "status": "running"} for uid in uids}
         self.replay_buffer.add(partition_id, items)
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        prompt_chunks = prompts.chunk(len(self.agent_loop_workers))
         ray.get(
             [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+                worker.generate_sequences.remote(prompt)
+                for worker, prompt in zip(self.agent_loop_workers, prompt_chunks, strict=False)
             ]
         )
 
@@ -865,9 +883,14 @@ class PPOTrainer:
                 [str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object
             )
             batch = tu.get_tensordict(batch_dict)
-            tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
-            tu.assign_non_tensor_data(batch, "validate", True)
-            self.async_rollout_manager.generate_sequences(batch)
+
+            tq_client = tq.get_client()
+            batch_meta = tq_client.put(batch, partition_id="raw_prompt")
+            batch_meta.extra_info.update(
+                {"global_steps": self.global_steps, "uids": batch_dict["uid"], "validate": True}
+            )
+
+            self.async_rollout_manager.generate_sequences(batch_meta)
 
             # 2. sample batch from replay buffer
             batch = self.replay_buffer.sample(partition_id="val", global_steps=self.global_steps)
@@ -952,6 +975,9 @@ class PPOTrainer:
 
             # 5. cleanup transfer queue and replay buffer
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            tq_client = tq.get_client()
+            tq_client.clear_partition("raw_prompt")
+            tq_client.clear_partition("agent_loop")
             self.replay_buffer.remove(batch.partition_id, batch.keys)
 
         # logger to wandb
@@ -1641,6 +1667,9 @@ class PPOTrainer:
 
                 # 7. cleanup transfer queue and replay buffer
                 tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+                tq_client = tq.get_client()
+                tq_client.clear_partition("raw_prompt")
+                tq_client.clear_partition("agent_loop")
                 self.replay_buffer.remove(batch.partition_id, batch.keys)
 
                 self.logger.log(data=metrics, step=self.global_steps)
@@ -1672,8 +1701,13 @@ class PPOTrainer:
             batch = torch.cat([tu.get_tensordict(sampled_batch_dict), tu.get_tensordict(baseline_batch_dict)], dim=0)
         else:
             batch = tu.get_tensordict(batch_dict)
-        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
-        self.async_rollout_manager.generate_sequences(batch)
+
+
+        tq_client = tq.get_client()
+        batch_meta = tq_client.put(batch, partition_id="raw_prompt")
+        batch_meta.extra_info.update({"global_steps": self.global_steps, "uids": batch_dict["uid"]})
+
+        self.async_rollout_manager.generate_sequences(batch_meta)
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
