@@ -16,9 +16,14 @@ import os
 from typing import Any
 from uuid import uuid4
 
+import torch
+from tensordict import TensorDict
+
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tensordict_utils import assign_non_tensor_stack
+from verl.utils.transferqueue_utils import BatchMeta, tq
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -78,6 +83,92 @@ class SingleTurnAgentLoop(AgentLoopBase):
             num_turns=2,
             metrics=metrics,
             extra_fields=output.extra_fields,
+        )
+
+        # keeping the schema consistent with tool_agent_loop
+        output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
+
+        return output
+
+
+@register("single_turn_agent_tq")
+class SingleTurnAgentLoopTQ(SingleTurnAgentLoop):
+    """Naive agent loop with TransferQueue that only do single turn chat completion."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.tq_client = tq.get_client()
+
+    @rollout_trace_op
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        messages = list(kwargs["raw_prompt"])
+
+        # 1. extract images and videos from messages
+        multi_modal_data = await self.process_vision_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+
+        # 2. apply chat template and tokenize
+        prompt_ids = await self.apply_chat_template(
+            messages,
+            images=images,
+            videos=videos,
+        )
+
+        # 3. prepare tensordict
+        td = TensorDict()
+        assign_non_tensor_stack(td, "prompt_ids", [prompt_ids])
+        if images:
+            assign_non_tensor_stack(td, "image_data", [images])
+        if videos:
+            assign_non_tensor_stack(td, "video_data", [videos])
+        td.batch_size = torch.Size([1])
+
+        # 4. write to TQ
+        batch_meta = await self.tq_client.async_put(td, partition_id="agent_loop")
+
+        # 5. generate sequences
+        metrics = {}
+        with simple_timer("generate_sequences", metrics):
+            output_meta: BatchMeta = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=batch_meta,
+                sampling_params=sampling_params,
+                response_length=self.response_length,
+            )
+
+        # 6. materialize BatchMeta and do post-process
+        data = await self.tq_client.async_get_data(output_meta)
+
+        if metrics.get("num_preempted") is None:
+            _num_preempted = output_meta.extra_info.get("num_preempted")
+            metrics["num_preempted"] = _num_preempted if _num_preempted is not None else -1
+
+        _token_ids = data.get("token_ids").unbind()[0].tolist()
+        response_len = min(len(_token_ids), self.response_length)
+        response_mask = [1] * response_len
+
+        _log_probs = data.get("log_probs")
+        if _log_probs is not None:
+            _log_probs = _log_probs.unbind()[0].tolist()
+        _routed_experts = data.get("routed_experts")
+        if _routed_experts is not None:
+            _routed_experts = _routed_experts.squeeze(0).tolist()
+        _extra_fields = output_meta.extra_info.get("extra_fields")
+
+        output: AgentLoopOutput = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=_token_ids[: self.response_length],
+            response_mask=response_mask,
+            response_logprobs=_log_probs[: self.response_length] if _log_probs is not None else None,
+            routed_experts=(
+                _routed_experts[: len(prompt_ids) + self.response_length] if _routed_experts is not None else None
+            ),
+            multi_modal_data=multi_modal_data,
+            num_turns=2,
+            metrics=metrics,
+            extra_fields=_extra_fields if _extra_fields is not None else {},
         )
 
         # keeping the schema consistent with tool_agent_loop

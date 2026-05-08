@@ -50,6 +50,8 @@ except ImportError:
     class _MockTQ:
         """Mock transfer_queue module that raises RuntimeError on any access."""
 
+        __is_mock__ = True
+
         def __getattr__(self, name: str) -> Any:
             def _raise(*args, **kwargs):
                 raise RuntimeError(

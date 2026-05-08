@@ -21,9 +21,11 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
+from tensordict import TensorDict
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.cli.serve import run_headless
@@ -39,6 +41,7 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.transferqueue_utils import BatchMeta, tq
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -163,6 +166,12 @@ class vLLMHttpServer:
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
+
+        if not getattr(tq, "__is_mock__", False):
+            tq.init()
+            self.tq_client = tq.get_client()
+        else:
+            self.tq_client = None
 
         self._post_init(cuda_visible_devices)
 
@@ -451,8 +460,23 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
-    ) -> TokenOutput:
+        response_length: Optional[int] = None,
+    ) -> TokenOutput | BatchMeta:
         """Generate sequence with token-in-token-out."""
+
+        if self.tq_client is not None:
+            td = await self.tq_client.async_get_data(prompt_ids)
+
+            prompt_ids = td[0]["prompt_ids"]
+            if "image_data" in td:
+                image_data = td[0]["image_data"]
+            else:
+                image_data = None
+            if "video_data" in td:
+                video_data = td[0]["video_data"]
+            else:
+                video_data = None
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -530,6 +554,8 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            if response_length is not None:
+                log_probs = log_probs[:response_length]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -548,6 +574,28 @@ class vLLMHttpServer:
 
         if hasattr(final_res.outputs[0], "num_preempted"):
             num_preempted = final_res.outputs[0].num_preempted
+
+        if self.tq_client is not None:
+            data = TensorDict()
+            data["token_ids"] = torch.tensor(token_ids).unsqueeze(0)
+            if log_probs is not None:
+                data["log_probs"] = torch.tensor(log_probs).unsqueeze(0)
+            if routed_experts is not None:
+                data["routed_experts"] = torch.tensor(routed_experts).unsqueeze(0)
+
+            data.batch_size = torch.Size([1])
+
+            meta = await self.tq_client.async_put(data, partition_id="agent_loop")
+
+            meta.extra_info.update(
+                {
+                    "stop_reason": stop_reason,
+                    "num_preempted": num_preempted,
+                    "extra_fields": extra_fields,
+                }
+            )
+
+            return meta
 
         return TokenOutput(
             token_ids=token_ids,
