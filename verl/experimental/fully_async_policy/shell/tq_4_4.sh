@@ -23,19 +23,22 @@ overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
 
-# Ray
-# RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
-# WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-# RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/examples/mtp_trainer/runtime_env.yaml"}
-NNODES=${NNODES:-16}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+
 # Paths
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/MiMo-7B-RL"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+MODEL_PATH=${MODEL_PATH:-"/home/z00931161/models/Qwen3-0.6B"}
+CKPTS_DIR=${CKPTS_DIR:-"./ckpts/${project_name}/${exp_name}"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/z00931161/datasets/gsm8k/train.parquet"}
+TEST_FILE=${TEST_FILE:-"/home/z00931161/datasets/gsm8k/train.parquet"}
+
+log_dir="./logs"
+mkdir -p $log_dir
+timestamp=$(date +"%Y%m%d%H%M%S")
+MODEL_ID=Qwen3-0.6B
+MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
+MODEL_NAME_ONLY=${MODEL_ID##*/}
+log_file="${log_dir}/${MODEL_NAME_ONLY}_${DATASET_NAME}_fully_async_transferqueue_longrun_${timestamp}.log"
+
 
 # Algorithm
 temperature=1.0
@@ -59,11 +62,6 @@ train_prompt_mini_bsz=32
 
 mtp_params=(
   actor_rollout_ref.actor.megatron.use_mbridge=True
-  actor_rollout_ref.model.mtp.enable=False
-  actor_rollout_ref.model.mtp.enable_train=True
-  actor_rollout_ref.model.mtp.mtp_loss_scaling_factor=0.1
-  actor_rollout_ref.model.mtp.detach_encoder=True
-  actor_rollout_ref.model.mtp.enable_rollout=True
   )
 
 fully_async=(
@@ -75,9 +73,9 @@ fully_async=(
   actor_rollout_ref.actor.optim.lr_decay_steps=51200
   rollout.total_rollout_steps=$(((512*100)))
   trainer.nnodes=1
-  trainer.n_gpus_per_node=4
+  trainer.n_gpus_per_node=8
   rollout.nnodes=1
-  rollout.n_gpus_per_node=4
+  rollout.n_gpus_per_node=8
   async_training.staleness_threshold=0.5
   async_training.trigger_parameter_sync_step=4
   async_training.require_batches=1
@@ -135,11 +133,12 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.context_parallel_size=${train_cp} \
     actor_rollout_ref.ref.megatron.param_offload=${offload} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$actor_ppo_max_token_len \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
@@ -147,11 +146,10 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     actor_rollout_ref.rollout.disable_log_stats=False \
-    actor_rollout_ref.rollout.prometheus.enable=True \
-    actor_rollout_ref.rollout.prometheus.port=44398 \
+    actor_rollout_ref.rollout.prometheus.enable=False \
     actor_rollout_ref.model.trust_remote_code=True \
     data.trust_remote_code=True \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=False \
@@ -162,4 +160,5 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.total_epochs=10 \
     "${mtp_params[@]}" \
     "${fully_async[@]}" \
-    "${transfer_queue[@]}"
+    "${transfer_queue[@]}" \
+    $@ 2>&1 | tee "$log_file"

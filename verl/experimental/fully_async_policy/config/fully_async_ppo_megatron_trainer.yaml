@@ -51,7 +51,7 @@ actor_rollout_ref:
     calculate_log_probs: True
 
     checkpoint_engine:
-      backend: "nccl"
+      backend: "hccl"
 
   actor:
     # Must use rollout log probs for training
