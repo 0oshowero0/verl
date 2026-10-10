@@ -53,7 +53,3 @@ backend:
 
     # Local buffer size in bytes **per client** (default: 1GB)
     local_buffer_size: 1073741824
-
-    # Whether to hard-pin objects in memory so they cannot be evicted.
-    # Set to null to disable hard pinning when offload is enabled and enable it otherwise.
-    hard_pin: true
